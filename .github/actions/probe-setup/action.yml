@@ -1,0 +1,17 @@
+name: Probe setup
+description: Installs the Rust toolchain for Probe reviews.
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: scripts/spellcheck-rust/native
+
+    - name: Build native crate
+      shell: bash
+      run: cargo build --all-targets --manifest-path scripts/spellcheck-rust/native/Cargo.toml

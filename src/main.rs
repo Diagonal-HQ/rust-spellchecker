@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead};
-use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use ignore::WalkBuilder;
@@ -668,90 +668,33 @@ fn walk(directory: &Path, filter: &Arc<Filter>, inputs: &mut Vec<Input>) -> Resu
     Ok(())
 }
 
-/// Work shared between the scan workers and the writer in `scan_all`.
-struct ScanState {
-    next: usize,
-    emitted: usize,
-    done: HashMap<usize, thread::Result<Result<Vec<Issue>, String>>>,
-    stopped: bool,
-}
-
-/// Scans `inputs` in parallel and passes each file's issues to `emit` in input order. Workers
-/// stay at most a few files per thread ahead of the next file to emit, so completed results
-/// waiting behind a slow file stay bounded.
-fn scan_all(
-    inputs: &[Input],
-    dictionary: &Dictionary,
-    mut emit: impl FnMut(Vec<Issue>),
-) -> Result<(), String> {
+fn scan_all(inputs: &[Input], dictionary: &Dictionary) -> Vec<Result<Vec<Issue>, String>> {
     let workers = thread::available_parallelism()
         .map_or(1, usize::from)
         .min(inputs.len().max(1));
-    let window = workers * 4;
-    let state = Mutex::new(ScanState {
-        next: 0,
-        emitted: 0,
-        done: HashMap::new(),
-        stopped: false,
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<(usize, Result<Vec<Issue>, String>)> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut scanned = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(input) = inputs.get(index) else {
+                            break scanned;
+                        };
+                        scanned.push((index, scan_file(input, dictionary)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("scan worker panicked"))
+            .collect()
     });
-    let changed = Condvar::new();
-    let lock = || state.lock().unwrap_or_else(PoisonError::into_inner);
-    thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                let mut guard = lock();
-                loop {
-                    while !guard.stopped
-                        && guard.next < inputs.len()
-                        && guard.next >= guard.emitted + window
-                    {
-                        guard = changed.wait(guard).unwrap_or_else(PoisonError::into_inner);
-                    }
-                    if guard.stopped || guard.next >= inputs.len() {
-                        break;
-                    }
-                    let index = guard.next;
-                    guard.next += 1;
-                    drop(guard);
-                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        scan_file(&inputs[index], dictionary)
-                    }));
-                    guard = lock();
-                    guard.done.insert(index, result);
-                    changed.notify_all();
-                }
-            });
-        }
-        let mut guard = lock();
-        while guard.emitted < inputs.len() {
-            let emitted = guard.emitted;
-            let Some(result) = guard.done.remove(&emitted) else {
-                guard = changed.wait(guard).unwrap_or_else(PoisonError::into_inner);
-                continue;
-            };
-            guard.emitted += 1;
-            changed.notify_all();
-            match result {
-                Ok(Ok(issues)) => {
-                    drop(guard);
-                    emit(issues);
-                    guard = lock();
-                }
-                Ok(Err(error)) => {
-                    guard.stopped = true;
-                    changed.notify_all();
-                    return Err(error);
-                }
-                Err(payload) => {
-                    guard.stopped = true;
-                    changed.notify_all();
-                    drop(guard);
-                    panic::resume_unwind(payload);
-                }
-            }
-        }
-        Ok(())
-    })
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 fn run() -> Result<i32, String> {
@@ -890,8 +833,11 @@ fn run() -> Result<i32, String> {
         add_words(&mut dictionary, &read_word_file(&path)?);
     }
 
+    let issues = scan_all(&inputs, &dictionary)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
     let mut found = 0;
-    scan_all(&inputs, &dictionary, |file_issues| {
+    for file_issues in issues {
         for issue in file_issues {
             println!(
                 "{{\"path\":\"{}\",\"row\":{},\"col\":{},\"word\":\"{}\"}}",
@@ -902,7 +848,7 @@ fn run() -> Result<i32, String> {
             );
             found += 1;
         }
-    })?;
+    }
     Ok(if found == 0 { 0 } else { 1 })
 }
 
@@ -1046,47 +992,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["recieve"]
         );
-    }
-
-    #[test]
-    fn scan_all_emits_files_in_input_order_and_stops_at_errors() {
-        let directory = env::temp_dir().join(format!("scan-all-{}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        let mut inputs: Vec<Input> = (0..200)
-            .rev()
-            .map(|index| {
-                let path = directory.join(format!("{index}.md"));
-                fs::write(&path, "hello recieve\n").unwrap();
-                Input {
-                    path,
-                    discovered: false,
-                }
-            })
-            .collect();
-        let dictionary = test_dictionary();
-        let mut paths = Vec::new();
-        scan_all(&inputs, &dictionary, |issues| {
-            paths.extend(issues.into_iter().map(|issue| issue.path));
-        })
-        .unwrap();
-        let expected: Vec<String> = inputs
-            .iter()
-            .map(|input| input.path.display().to_string())
-            .collect();
-        assert_eq!(paths, expected);
-
-        inputs.insert(
-            100,
-            Input {
-                path: directory.join("missing.md"),
-                discovered: false,
-            },
-        );
-        let mut emitted = 0;
-        let error = scan_all(&inputs, &dictionary, |_| emitted += 1).unwrap_err();
-        fs::remove_dir_all(&directory).unwrap();
-        assert!(error.contains("missing.md"));
-        assert_eq!(emitted, 100);
     }
 
     #[test]

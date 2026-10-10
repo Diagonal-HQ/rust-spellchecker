@@ -1,6 +1,6 @@
 <?php
 
-// cspell:words bexclud bunauthori
+// spellcheck:words bexclud bunauthori
 
 $colors = ['#f8fafc', '#F4FBFC'];
 $png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';

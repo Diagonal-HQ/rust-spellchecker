@@ -9,9 +9,7 @@ runs:
         components: rustfmt, clippy
 
     - uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: scripts/spellcheck-rust/native
 
-    - name: Build native crate
+    - name: Build crate
       shell: bash
-      run: cargo build --all-targets --manifest-path scripts/spellcheck-rust/native/Cargo.toml
+      run: cargo build --all-targets

@@ -1,25 +1,124 @@
-# Rust spellchecker pilot
+# diagonal-spellcheck
 
-Custom Rust spellchecker research from Diagonal. The dependency-free Rust crate supports native scans with a prepared CSpell-derived lexicon. The hybrid wrapper delegates findings and suggestions to CSpell.
+A source-code spellchecker written in Rust. Its English and software-terms lexicon is embedded in the binary. It checks identifiers, strings, comments, and prose in any text file. It splits camelCase and snake_case, and it skips URLs, email addresses, Markdown link targets, hex, UUIDs, Base64, date format strings, and random-looking tokens.
 
-This is a source snapshot for review. It is not a drop-in CSpell replacement or a published package. Diagonal continues to use CSpell by default and in CI.
+## Install
 
-## Native crate
-
-Build the crate from this repository:
+Prebuilt binaries are attached to each [GitHub Release](https://github.com/Diagonal-HQ/rust-spellchecker/releases). They're available for macOS (Apple silicon) and Linux (x86_64 and arm64, statically linked). Each archive contains the binary, this README, and `NOTICE.md`.
 
 ```sh
-cargo build --release --manifest-path scripts/spellcheck-rust/native/Cargo.toml
+version=0.1.0
+target=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+archive=diagonal-spellcheck-$version-$target.tar.gz
+base=https://github.com/Diagonal-HQ/rust-spellchecker/releases/download/v$version
+curl -fsSLO "$base/$archive"
+curl -fsSL "$base/$archive.sha256" | shasum -a 256 -c -
+tar -xzf "$archive"
+sudo install "diagonal-spellcheck-$version-$target/diagonal-spellcheck" /usr/local/bin/
 ```
 
-The executable requires a prepared dictionary and explicit input files. Dictionary preparation requires the consuming Diagonal checkout and its locked CSpell installation. Generated dictionaries, downloaded engines, build artifacts, application dependencies, and application Git history are excluded from this repository.
+Or build from source:
 
-## Diagonal integration
+```sh
+cargo install --locked --git https://github.com/Diagonal-HQ/rust-spellchecker --tag v0.1.0
+# or, from a checkout:
+cargo build --release   # target/release/diagonal-spellcheck
+```
 
-The JavaScript wrappers and corpus tests retain their original Diagonal paths and assumptions. They require Diagonal's root config, dependency lockfile, production files, and worktree lifecycle. They do not run as a standalone npm project here. See [integration instructions](integration/README.md).
+## Usage
 
-The [pilot README](scripts/spellcheck-rust/README.md) describes the implementation and preliminary measurements. The [local verification report](scripts/spellcheck-rust/VERIFICATION.md) records the source checkout's checks and setup blocker before export. These documents retain that historical context.
+```sh
+diagonal-spellcheck [--config PATH|--no-config] [--dictionary PATH] [--words PATH]... [--exclude GLOB]... [--file-list PATH|-] [PATHS...]
+```
 
-## Verification status
+```sh
+diagonal-spellcheck                           # the project described by spellcheck.toml, or the current directory
+diagonal-spellcheck .                         # audit every file under the current directory
+diagonal-spellcheck src docs README.md        # mix directories and files
+diagonal-spellcheck --exclude 'fixtures/**' --words project-words.txt .
+```
 
-Nineteen Rust tests, formatting, all-target compilation, and release compilation passed in the source checkout. The expanded 103-file CSpell differential suite and new benchmarks have not run because the source checkout's setup remains incomplete. Direct native suggestions remain absent. The clean fast path remains experimental. No CI workflows are included in this snapshot.
+- `PATHS...` and `--file-list` name files or directories to check. A file list has one path per line, and `-` reads it from standard input. Relative paths resolve from the working directory. With no paths and no file list, the tool checks the directory containing the config file, or the working directory if there is no config.
+- Directories are walked recursively, in sorted order:
+  - `.gitignore`, `.ignore`, and global git excludes are respected, even outside a Git repository.
+  - Hidden files and directories are skipped.
+  - Binary files (anything containing a NUL byte) and files that aren't UTF-8 are skipped.
+  - Lockfiles and generated files are excluded by default: `*.lock`, `*-lock.json`, `*-lock.yaml`, `*.min.js`, `*.min.css`, `*.map`, `*.snap`.
+- Excludes and the config's `include` apply to explicitly named files too, so a pre-commit hook can pass every changed file and let the config decide. A missing or non-UTF-8 explicit file that passes the filters is an error.
+- `--exclude GLOB` skips matching paths. Globs use `.gitignore` syntax anchored at the working directory. It can be repeated.
+- `--words PATH` adds accepted words from a file, one per line. `#` lines are comments. Use this for project vocabulary. It can be repeated.
+- `--dictionary PATH` replaces the built-in lexicon with a file in the [lexicon format](#lexicon).
+- `--config PATH` uses a specific config file instead of discovering one, and `--no-config` disables config files.
+
+Each finding is printed as a JSON line:
+
+```json
+{"path":"src/app.ts","row":3,"col":17,"word":"recieve"}
+```
+
+Files are scanned in parallel, and output follows input order: explicit paths in argument order, with walked files sorted within each directory. `row` and `col` are 1-based. `col` counts UTF-16 code units, which matches most editors' column numbering. The exit code is `0` when nothing is found, `1` when there are findings, and `2` for usage, file, or dictionary errors.
+
+## Configuration
+
+The tool loads `spellcheck.toml` from the working directory or its nearest parent:
+
+```toml
+# Only check files matching these globs. Omit to check everything.
+include = [
+  "src/**/*.{ts,tsx}",
+  "app/*/src/**/*.php",
+  "docs/**/*.md",
+  "/README.md",
+]
+
+# Skip these, in addition to .gitignore and the built-in lockfile excludes.
+exclude = ["src/generated/", "*.test.ts", "!src/important.test.ts"]
+
+# Project vocabulary, inline and/or from files with one word per line.
+words = ["Diagonal", "Inertia"]
+word_files = ["spellcheck-words.txt"]
+```
+
+- All keys are optional. Unknown keys are an error, so a typo in a setting never quietly changes results.
+- `include` and `exclude` use `.gitignore` syntax anchored at the config file's directory. A pattern containing a `/` (or starting with one) matches from that directory, and a bare pattern like `*.test.ts` matches at any depth. A trailing `/` matches directories, `!` re-includes, and `{a,b}` alternatives work.
+- `word_files` paths are relative to the config file. Words from the config, `--words`, and in-file directives are all added to the lexicon.
+- Command-line `--exclude` and `--words` add to the config rather than replacing it.
+
+### In-file directives
+
+| Directive | Effect |
+| --- | --- |
+| `spellcheck:words foo, bar` | Accepts the words in this file. `spellcheck:ignore` works the same way. |
+| `spellcheck:disable-next-line` | Skips the next line. |
+| `spellcheck:disable` / `spellcheck:enable` | Skips the lines between them. |
+
+Lines containing a directive are never checked.
+
+## Lexicon
+
+[`lexicon/lexicon.txt`](lexicon/lexicon.txt) is the built-in word list, embedded at compile time. It has about 245,800 lower-cased words, copied from the CSpell 10.1.1 dictionaries (English, software terms, TypeScript, Node, npm, PHP, HTML, CSS, fonts, AWS, and others). `@compound<TAB>part` lines list compound-word parts: a trailing `+` marks a part that starts a compound, a leading `+` marks one that ends it, and both mark a middle part. [`lexicon/NOTICE.md`](lexicon/NOTICE.md) carries the source packages' licenses (all MIT, plus the SCOWL notice for `en_US`).
+
+CSpell supplies only this word data. The tokenizer, filters, directives, and output are this crate's own.
+
+## Test
+
+```sh
+cargo test
+```
+
+`tests/fixtures.rs` checks the fixtures in `tests/fixtures/` against `tests/fixtures/expected.jsonl` using the built-in lexicon.
+
+## Releasing
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs on every push to `main` and on pull requests:
+
+- formatting, Clippy, and the tests on Linux and macOS
+- release builds for all three targets, each smoke-tested against the fixtures
+- archives with SHA-256 checksums, uploaded as workflow artifacts
+
+On `main`, if no release exists for the version in `Cargo.toml`, the workflow tags the commit `v<version>` and publishes a GitHub Release with the archives, per-archive `.sha256` files, and a combined `SHA256SUMS`. To release, bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` updates), then merge to `main`. Pushes that don't change the version build and test but publish nothing, so a released version's files never change.
+
+## Limitations
+
+- No suggestions.
+- No per-language parsing. Every file is tokenized the same way, except that Markdown link targets are skipped in `.md` files.

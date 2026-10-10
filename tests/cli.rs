@@ -437,3 +437,36 @@ fn an_unwritable_output_is_an_error() {
             .starts_with("could not write output:")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn paths_through_a_symlink_still_match_the_config() {
+    let fixture = Fixture::new();
+    let project = fixture.0.join("project");
+    fs::create_dir_all(project.join("docs")).unwrap();
+    fs::write(
+        project.join("spellcheck.toml"),
+        "include = [\"docs/**/*.md\"]\n",
+    )
+    .unwrap();
+    fs::write(project.join("docs/guide.md"), "mispeling\n").unwrap();
+    let link = fixture.0.join("link");
+    std::os::unix::fs::symlink(&project, &link).unwrap();
+
+    // The binary runs in the real project directory; the arguments go through the symlink.
+    for argument in [link.join("docs/guide.md"), link.join("docs")] {
+        let result = Command::new(env!("CARGO_BIN_EXE_diagonal-spellcheck"))
+            .current_dir(&project)
+            .arg(&argument)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1), "{}", argument.display());
+        assert!(
+            String::from_utf8(result.stdout)
+                .unwrap()
+                .contains("\"word\":\"mispeling\""),
+            "{}",
+            argument.display()
+        );
+    }
+}

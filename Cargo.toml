@@ -1,6 +1,6 @@
 [package]
 name = "diagonal-spellcheck"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A source-code spellchecker with an embedded English and software-terms lexicon"
 repository = "https://github.com/Diagonal-HQ/rust-spellchecker"

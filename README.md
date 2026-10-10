@@ -7,7 +7,7 @@ A source-code spellchecker written in Rust. Its English and software-terms lexic
 Prebuilt binaries are attached to each [GitHub Release](https://github.com/Diagonal-HQ/rust-spellchecker/releases). They're available for macOS (Apple silicon) and Linux (x86_64 and arm64, statically linked). Each archive contains the binary, this README, the license files, and `NOTICE.md`.
 
 ```sh
-version=0.1.1
+version=0.1.2
 target=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 archive=diagonal-spellcheck-$version-$target.tar.gz
 base=https://github.com/Diagonal-HQ/rust-spellchecker/releases/download/v$version
@@ -20,7 +20,7 @@ sudo install "diagonal-spellcheck-$version-$target/diagonal-spellcheck" /usr/loc
 Or build from source:
 
 ```sh
-cargo install --locked --git https://github.com/Diagonal-HQ/rust-spellchecker --tag v0.1.1
+cargo install --locked --git https://github.com/Diagonal-HQ/rust-spellchecker --tag v0.1.2
 # or, from a checkout:
 cargo build --release   # target/release/diagonal-spellcheck
 ```

@@ -86,6 +86,8 @@ impl Patterns {
         globs: impl IntoIterator<Item = &'a str>,
         source: &str,
     ) -> Result<Self, String> {
+        // The working directory is already a real path; a --config path may go through a symlink.
+        let root = fs::canonicalize(&root).unwrap_or(root);
         let mut builder = GitignoreBuilder::new(&root);
         let mut outside = GitignoreBuilder::new(&root);
         for glob in globs {
@@ -111,6 +113,20 @@ impl Patterns {
     }
 
     fn matches(&self, path: &Path, is_dir: bool) -> bool {
+        // A path can reach the root through a symlink, such as /tmp on macOS, so resolve it
+        // before treating it as outside. Paths already under the root skip the syscall.
+        let resolved;
+        let path = if path.starts_with(&self.root) {
+            path
+        } else {
+            match fs::canonicalize(path) {
+                Ok(real) => {
+                    resolved = real;
+                    &resolved
+                }
+                Err(_) => path,
+            }
+        };
         match path.strip_prefix(&self.root) {
             Ok(relative) => self
                 .matcher

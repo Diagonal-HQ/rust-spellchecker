@@ -1,0 +1,872 @@
+use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::io::{self, BufRead};
+use std::path::{Path, PathBuf};
+
+const MAIN_SOURCE: &str = include_str!("main.rs");
+const CARGO_TOML: &str = include_str!("../Cargo.toml");
+const CARGO_LOCK: &str = include_str!("../Cargo.lock");
+
+fn fnv1a64(value: &[u8]) -> u64 {
+    value.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn print_provenance() {
+    println!("main.rs.fnv1a64={:016x}", fnv1a64(MAIN_SOURCE.as_bytes()));
+    println!("Cargo.toml.fnv1a64={:016x}", fnv1a64(CARGO_TOML.as_bytes()));
+    println!("Cargo.lock.fnv1a64={:016x}", fnv1a64(CARGO_LOCK.as_bytes()));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Issue {
+    path: String,
+    row: usize,
+    col: usize,
+    word: String,
+}
+
+struct Dictionary {
+    words: HashSet<String>,
+    compound_start: HashSet<String>,
+    compound_middle: HashSet<String>,
+    compound_end: HashSet<String>,
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+fn load_dictionary(path: &Path) -> Result<Dictionary, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("could not read dictionary {}: {error}", path.display()))?;
+    let mut dictionary = Dictionary {
+        words: HashSet::new(),
+        compound_start: HashSet::new(),
+        compound_middle: HashSet::new(),
+        compound_end: HashSet::new(),
+    };
+    for line in content
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let Some(marker) = line.strip_prefix("@compound\t") else {
+            dictionary.words.insert(line.to_owned());
+            continue;
+        };
+        let leading = marker.starts_with('+');
+        let trailing = marker.ends_with('+');
+        let word = marker.trim_matches('+').to_owned();
+        match (leading, trailing) {
+            (false, true) => {
+                dictionary.compound_start.insert(word);
+            }
+            (true, true) => {
+                dictionary.compound_middle.insert(word);
+            }
+            (true, false) => {
+                dictionary.compound_end.insert(word);
+            }
+            _ => {}
+        }
+    }
+    if dictionary.words.is_empty() {
+        return Err("dictionary contains no accepted words".into());
+    }
+    Ok(dictionary)
+}
+
+fn parse_directive_words(line: &str) -> Vec<String> {
+    let lowercase = line.to_ascii_lowercase();
+    let Some(cspell) = lowercase.find("cspell:") else {
+        return Vec::new();
+    };
+    let directive = &line[cspell + "cspell:".len()..];
+    let mut fields = directive.split(|c: char| c.is_whitespace() || c == ',' || c == ';');
+    let Some(command) = fields.next() else {
+        return Vec::new();
+    };
+    if !matches!(
+        command.to_ascii_lowercase().as_str(),
+        "word" | "words" | "ignore" | "ignoreword" | "ignorewords" | "ignore-word" | "ignore-words"
+    ) {
+        return Vec::new();
+    }
+    fields
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '’'))
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_locale_lowercase())
+        .collect()
+}
+
+trait LocaleLowercase {
+    fn to_locale_lowercase(&self) -> String;
+}
+
+impl LocaleLowercase for str {
+    fn to_locale_lowercase(&self) -> String {
+        self.chars()
+            .flat_map(char::to_lowercase)
+            .map(|character| {
+                if matches!(character, '’' | '`') {
+                    '\''
+                } else {
+                    character
+                }
+            })
+            .collect()
+    }
+}
+
+fn is_compound(word: &str, dictionary: &Dictionary) -> bool {
+    fn finish(rest: &str, dictionary: &Dictionary) -> bool {
+        if dictionary.compound_end.contains(rest) {
+            return true;
+        }
+        for (byte, _) in rest.char_indices().skip(1) {
+            if dictionary.compound_middle.contains(&rest[..byte])
+                && finish(&rest[byte..], dictionary)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    for (byte, _) in word.char_indices().skip(1) {
+        if dictionary.compound_start.contains(&word[..byte]) && finish(&word[byte..], dictionary) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_accepted(word: &str, dictionary: &Dictionary, local_words: &HashSet<String>) -> bool {
+    let normalized = word.to_locale_lowercase();
+    dictionary.words.contains(&normalized)
+        || local_words.contains(&normalized)
+        || is_compound(&normalized, dictionary)
+        || normalized
+            .strip_suffix("'s")
+            .is_some_and(|base| dictionary.words.contains(base) || local_words.contains(base))
+        || {
+            let trimmed = normalized.trim_matches(['.', '-', '+', '_', '\'', '`']);
+            trimmed != normalized
+                && (dictionary.words.contains(trimmed)
+                    || local_words.contains(trimmed)
+                    || is_compound(trimmed, dictionary))
+        }
+}
+
+fn camel_parts(word: &str, start_byte: usize) -> Vec<(usize, String)> {
+    let characters: Vec<(usize, char)> = word.char_indices().collect();
+    if characters.is_empty() {
+        return Vec::new();
+    }
+    let mut breaks = vec![0];
+    for index in 1..characters.len() {
+        let previous = characters[index - 1].1;
+        let current = characters[index].1;
+        let next = characters.get(index + 1).map(|(_, c)| *c);
+        if (previous.is_lowercase() && current.is_uppercase())
+            || (previous.is_uppercase()
+                && current.is_uppercase()
+                && next.is_some_and(char::is_lowercase))
+        {
+            breaks.push(characters[index].0);
+        }
+    }
+    breaks.push(word.len());
+    breaks
+        .windows(2)
+        .map(|range| (start_byte + range[0], word[range[0]..range[1]].to_owned()))
+        .collect()
+}
+
+fn is_repeating(word: &str) -> bool {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    word.chars().count() >= 4 && chars.all(|character| character.eq_ignore_ascii_case(&first))
+}
+
+fn raw_words(line: &str) -> Vec<(usize, String)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (offset, character) in line.char_indices() {
+        let in_word = character.is_alphabetic() || character == '\'' || character == '’';
+        match (start, in_word) {
+            (None, true) => start = Some(offset),
+            (Some(begin), false) => {
+                let word = line[begin..offset].trim_matches(['\'', '’']);
+                let adjustment = line[begin..offset].find(word).unwrap_or(0);
+                if !word.is_empty() {
+                    words.push((begin + adjustment, word.to_owned()));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        let word = line[begin..].trim_matches(['\'', '’']);
+        let adjustment = line[begin..].find(word).unwrap_or(0);
+        if !word.is_empty() {
+            words.push((begin + adjustment, word.to_owned()));
+        }
+    }
+    words
+}
+
+fn possible_words(line: &str) -> Vec<(usize, String)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (offset, character) in line.char_indices() {
+        let in_word = character.is_alphanumeric()
+            || matches!(character, '_' | '\'' | '’' | '`' | '.' | '+' | '-');
+        match (start, in_word) {
+            (None, true) => start = Some(offset),
+            (Some(begin), false) => {
+                let word = &line[begin..offset];
+                if word.chars().any(char::is_alphabetic) {
+                    words.push((begin, word.to_owned()));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        let word = &line[begin..];
+        if word.chars().any(char::is_alphabetic) {
+            words.push((begin, word.to_owned()));
+        }
+    }
+    words
+}
+
+fn remove_escape_prefix(
+    line: &str,
+    byte: usize,
+    word: &str,
+    dictionary: &Dictionary,
+    local_words: &HashSet<String>,
+) -> (usize, String) {
+    if byte > 0
+        && line.as_bytes()[byte - 1] == b'\\'
+        && word
+            .chars()
+            .next()
+            .is_some_and(|character| "anrvtbfgANRVTBFG".contains(character))
+    {
+        let first_length = word.chars().next().map_or(0, char::len_utf8);
+        let remainder = &word[first_length..];
+        if !components_are_accepted(word, dictionary, local_words)
+            && components_are_accepted(remainder, dictionary, local_words)
+        {
+            return (byte + first_length, remainder.to_owned());
+        }
+    }
+    (byte, word.to_owned())
+}
+
+fn components_are_accepted(
+    word: &str,
+    dictionary: &Dictionary,
+    local_words: &HashSet<String>,
+) -> bool {
+    let mut found = false;
+    for (_, raw) in raw_words(word) {
+        found = true;
+        if is_accepted(&raw, dictionary, local_words) {
+            continue;
+        }
+        for part in raw.split(['\'', '’', '`']) {
+            for (_, camel) in camel_parts(part, 0) {
+                if camel.chars().count() >= 4 && !is_accepted(&camel, dictionary, local_words) {
+                    return false;
+                }
+            }
+        }
+    }
+    found
+}
+
+fn is_hex_sequence(word: &str) -> bool {
+    word.len() >= 4
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        && word
+            .bytes()
+            .any(|byte| byte.is_ascii_digit() || byte == b'-')
+        && (word == word.to_ascii_lowercase() || word == word.to_ascii_uppercase())
+}
+
+fn is_css_hex(line: &str, byte: usize, word: &str) -> bool {
+    line[..byte].ends_with('#')
+        && (3..=8).contains(&word.len())
+        && word.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_random_string(word: &str) -> bool {
+    if word.len() < 40 {
+        return false;
+    }
+    let mut categories = 0usize;
+    let mut previous = None;
+    for character in word.chars() {
+        let category = if character.is_ascii_digit() {
+            0
+        } else if character.is_lowercase() {
+            1
+        } else if character.is_uppercase() {
+            2
+        } else if matches!(character, '-' | '_' | '.' | '\'') {
+            3
+        } else {
+            4
+        };
+        if previous != Some(category) {
+            categories += 1;
+            previous = Some(category);
+        }
+    }
+    categories as f64 / word.chars().count() as f64 >= 0.5
+}
+
+fn url_ranges(line: &str) -> Vec<(usize, usize)> {
+    let lowercase = line.to_ascii_lowercase();
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = ["http://", "https://", "ftp://"]
+        .iter()
+        .filter_map(|scheme| lowercase[from..].find(scheme))
+        .min()
+    {
+        let start = from + relative;
+        let end = line[start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'))
+            .map_or(line.len(), |length| start + length);
+        ranges.push((start, end));
+        from = end.max(start + 1);
+    }
+    ranges
+}
+
+fn email_ranges(line: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for (at, _) in line.match_indices('@') {
+        let start = line[..at]
+            .rfind(|character: char| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '<' | '>')
+            })
+            .map_or(0, |index| index + 1);
+        let end = line[at..]
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '<' | '>')
+            })
+            .map_or(line.len(), |length| at + length);
+        if line[start..end].contains('.') {
+            ranges.push((start, end));
+        }
+    }
+    ranges
+}
+
+fn is_ascii_alphabet_sequence(word: &str) -> bool {
+    word == "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+}
+
+fn markdown_link_ranges(line: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = line[from..].find("](") {
+        let start = from + relative + 2;
+        let end = line[start..]
+            .find(')')
+            .map_or(line.len(), |length| start + length);
+        ranges.push((start, end));
+        if end == line.len() {
+            break;
+        }
+        from = end + 1;
+    }
+    ranges
+}
+
+fn base64_ranges(line: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (offset, character) in line.char_indices() {
+        let allowed = character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=');
+        match (start, allowed) {
+            (None, true) => start = Some(offset),
+            (Some(begin), false) => {
+                let candidate = &line[begin..offset];
+                if candidate.len() >= 40
+                    && candidate
+                        .bytes()
+                        .any(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'/'))
+                    && candidate.bytes().any(|byte| byte.is_ascii_lowercase())
+                    && candidate.bytes().any(|byte| byte.is_ascii_uppercase())
+                {
+                    ranges.push((begin, offset));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        let candidate = &line[begin..];
+        if candidate.len() >= 40
+            && candidate
+                .bytes()
+                .any(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'/'))
+            && candidate.bytes().any(|byte| byte.is_ascii_lowercase())
+            && candidate.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
+            ranges.push((begin, line.len()));
+        }
+    }
+    ranges
+}
+
+fn is_date_format_string(word: &str) -> bool {
+    let letters: Vec<char> = word
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .collect();
+    letters.len() >= 6
+        && letters
+            .iter()
+            .all(|character| "yYMdDTHhmsSXxZ".contains(*character))
+        && letters.windows(2).any(|pair| pair[0] != pair[1])
+}
+
+fn all_caps_base_with_suffix<'a>(
+    word: &'a str,
+    dictionary: &Dictionary,
+    local_words: &HashSet<String>,
+) -> Option<&'a str> {
+    for suffix in ["ing", "ies", "es", "ings", "ize", "ed", "ning", "s"] {
+        let Some(base) = word.strip_suffix(suffix) else {
+            continue;
+        };
+        if base.chars().count() >= 2
+            && base.chars().all(|character| character.is_uppercase())
+            && is_accepted(base, dictionary, local_words)
+        {
+            return Some(base);
+        }
+    }
+    None
+}
+
+fn escaped_contraction_is_accepted(
+    line: &str,
+    byte: usize,
+    word: &str,
+    dictionary: &Dictionary,
+    local_words: &HashSet<String>,
+) -> bool {
+    let end = byte + word.len();
+    let Some(after_escape) = line[end..].strip_prefix("\\'") else {
+        return false;
+    };
+    let suffix: String = after_escape
+        .chars()
+        .take_while(|character| character.is_alphabetic())
+        .collect();
+    !suffix.is_empty() && is_accepted(&format!("{word}'{suffix}"), dictionary, local_words)
+}
+
+fn byte_to_column(line: &str, byte: usize) -> usize {
+    line[..byte].encode_utf16().count() + 1
+}
+
+fn scan_file(path: &Path, dictionary: &Dictionary) -> Result<Vec<Issue>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    Ok(scan_text(path, &content, dictionary))
+}
+
+fn scan_text(path: &Path, content: &str, dictionary: &Dictionary) -> Vec<Issue> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut local_words = HashSet::new();
+    for line in &lines {
+        local_words.extend(parse_directive_words(line));
+    }
+
+    let mut issues = Vec::new();
+    let mut disabled_block = false;
+    let mut disable_next_line = false;
+    for (index, line) in lines.iter().enumerate() {
+        let lowercase = line.to_lowercase();
+        let is_directive_line = lowercase.contains("cspell:");
+        let disabled_for_line = disabled_block || disable_next_line;
+        disable_next_line = false;
+
+        if lowercase.contains("cspell:disable-next-line")
+            || lowercase.contains("cspell:disable-next")
+        {
+            disable_next_line = true;
+        }
+        if lowercase.contains("cspell:disable")
+            && !lowercase.contains("cspell:disable-line")
+            && !lowercase.contains("cspell:disable-next")
+        {
+            disabled_block = true;
+        }
+        if lowercase.contains("cspell:enable") {
+            disabled_block = false;
+        }
+        if disabled_for_line || is_directive_line || lowercase.contains("cspell:disable-line") {
+            continue;
+        }
+
+        let mut ignored_ranges = url_ranges(line);
+        ignored_ranges.extend(email_ranges(line));
+        ignored_ranges.extend(base64_ranges(line));
+        if path.extension().is_some_and(|extension| extension == "md") {
+            ignored_ranges.extend(markdown_link_ranges(line));
+        }
+        for (possible_byte, possible_word) in possible_words(line) {
+            if ignored_ranges.iter().any(|(start, end)| {
+                possible_byte < *end && possible_byte + possible_word.len() > *start
+            }) {
+                continue;
+            }
+            let (possible_byte, possible_word) = remove_escape_prefix(
+                line,
+                possible_byte,
+                &possible_word,
+                dictionary,
+                &local_words,
+            );
+            let possible_core = possible_word.trim_matches(['\'', '’', '`', '.', '+', '-', '_']);
+            if possible_word.is_empty()
+                || is_ascii_alphabet_sequence(possible_core)
+                || is_hex_sequence(possible_core)
+                || is_css_hex(line, possible_byte, possible_core)
+                || is_random_string(possible_core)
+                || is_date_format_string(possible_core)
+                || is_accepted(&possible_word, dictionary, &local_words)
+                || all_caps_base_with_suffix(possible_core, dictionary, &local_words).is_some()
+            {
+                continue;
+            }
+            for (inner_byte, inner_word) in raw_words(&possible_word) {
+                let inner_byte = possible_byte + inner_byte;
+                if escaped_contraction_is_accepted(
+                    line,
+                    inner_byte,
+                    &inner_word,
+                    dictionary,
+                    &local_words,
+                ) || is_accepted(&inner_word, dictionary, &local_words)
+                {
+                    continue;
+                }
+                let mut quote_offset = 0;
+                for quote_part in inner_word.split_inclusive(['\'', '’', '`']) {
+                    let part_byte = inner_byte + quote_offset;
+                    quote_offset += quote_part.len();
+                    let quote_part = quote_part.trim_end_matches(['\'', '’', '`']);
+                    for (byte, word) in camel_parts(quote_part, part_byte) {
+                        if word.chars().count() < 4
+                            || is_repeating(&word)
+                            || is_accepted(&word, dictionary, &local_words)
+                        {
+                            continue;
+                        }
+                        issues.push(Issue {
+                            path: path.to_string_lossy().replace('\\', "/"),
+                            row: index + 1,
+                            col: byte_to_column(line, byte),
+                            word,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    issues
+}
+
+fn usage() -> &'static str {
+    "usage: diagonal-spellcheck --dictionary PATH [--file-list PATH|-] [FILES...]"
+}
+
+fn run() -> Result<i32, String> {
+    let mut arguments = env::args().skip(1);
+    let mut dictionary = None;
+    let mut file_list = None;
+    let mut files = Vec::new();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--dictionary" if dictionary.is_none() => {
+                dictionary = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| format!("--dictionary requires a path\n{}", usage()))?,
+                ));
+            }
+            "--file-list" if file_list.is_none() => {
+                file_list = Some(
+                    arguments
+                        .next()
+                        .filter(|value| value == "-" || !value.starts_with('-'))
+                        .ok_or_else(|| format!("--file-list requires a path\n{}", usage()))?,
+                );
+            }
+            "--version" => {
+                println!("diagonal-spellcheck {}", env!("CARGO_PKG_VERSION"));
+                return Ok(0);
+            }
+            "--provenance" => {
+                print_provenance();
+                return Ok(0);
+            }
+            "--help" | "-h" => {
+                println!("{}", usage());
+                return Ok(0);
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown option {value}\n{}", usage()));
+            }
+            value => files.push(PathBuf::from(value)),
+        }
+    }
+    let dictionary_path =
+        dictionary.ok_or_else(|| format!("--dictionary is required\n{}", usage()))?;
+    if let Some(list) = file_list {
+        let reader: Box<dyn BufRead> = if list == "-" {
+            Box::new(io::BufReader::new(io::stdin()))
+        } else {
+            Box::new(io::BufReader::new(fs::File::open(&list).map_err(
+                |error| format!("could not read file list {list}: {error}"),
+            )?))
+        };
+        for line in reader.lines() {
+            let line = line.map_err(|error| format!("could not read file list: {error}"))?;
+            if !line.is_empty() {
+                files.push(PathBuf::from(line));
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(format!("no input files\n{}", usage()));
+    }
+
+    let dictionary = load_dictionary(&dictionary_path)?;
+    let mut found = 0;
+    for path in files {
+        for issue in scan_file(&path, &dictionary)? {
+            println!(
+                "{{\"path\":\"{}\",\"row\":{},\"col\":{},\"word\":\"{}\",\"suggestions\":[]}}",
+                json_escape(&issue.path),
+                issue.row,
+                issue.col,
+                json_escape(&issue.word),
+            );
+            found += 1;
+        }
+    }
+    Ok(if found == 0 { 0 } else { 1 })
+}
+
+fn main() {
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_camel_case_with_offsets() {
+        assert_eq!(
+            camel_parts("calculateRecieptTotl", 6),
+            vec![
+                (6, "calculate".into()),
+                (15, "Reciept".into()),
+                (22, "Totl".into())
+            ]
+        );
+        assert_eq!(
+            camel_parts("InvoiceAddres", 0),
+            vec![(0, "Invoice".into()), (7, "Addres".into())]
+        );
+    }
+
+    #[test]
+    fn locates_unicode_columns_by_utf16_code_unit() {
+        assert_eq!(byte_to_column("café résumé", "café ".len()), 6);
+        assert_eq!(byte_to_column("😀 recieve", "😀 ".len()), 4);
+    }
+
+    #[test]
+    fn extracts_directive_words() {
+        assert_eq!(
+            parse_directive_words("// cspell:words Zorbulate, LocalThing"),
+            ["zorbulate", "localthing"]
+        );
+        assert_eq!(
+            parse_directive_words("İ // cspell:words Zorbulate"),
+            ["zorbulate"]
+        );
+    }
+
+    #[test]
+    fn identifies_cspell_style_hex_sequences() {
+        assert!(is_hex_sequence("f8fafc"));
+        assert!(is_hex_sequence("e764e712-30e8-724d-a86f-eadf8dfcd067"));
+        assert!(!is_hex_sequence("recieve"));
+        assert_eq!(possible_words("'#f8fafc'"), vec![(2, "f8fafc'".into())]);
+    }
+
+    #[test]
+    fn identifies_base64_ranges() {
+        let line = "$png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';";
+        let ranges = base64_ranges(line);
+        assert_eq!(ranges.len(), 1);
+        assert!(line[ranges[0].0..ranges[0].1].starts_with("iVBOR"));
+    }
+
+    #[test]
+    fn provenance_hash_changes_with_content() {
+        assert_ne!(fnv1a64(b"one"), fnv1a64(b"two"));
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+    }
+
+    fn test_dictionary() -> Dictionary {
+        Dictionary {
+            words: ["hello", "world", "don't", "invoice", "total", "café"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            compound_start: ["rate".to_owned()].into_iter().collect(),
+            compound_middle: ["limit".to_owned()].into_iter().collect(),
+            compound_end: ["reset".to_owned()].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn markdown_targets_at_end_of_line_and_unclosed_targets_do_not_panic() {
+        assert_eq!(markdown_link_ranges("[hello](mispeling)"), [(8, 17)]);
+        assert_eq!(markdown_link_ranges("[hello](mispeling"), [(8, 17)]);
+        assert_eq!(
+            markdown_link_ranges("[hello](one)[world](two)"),
+            [(8, 11), (20, 23)]
+        );
+        let issues = scan_text(
+            Path::new("sample.md"),
+            "recieve [hello](mispeling)",
+            &test_dictionary(),
+        );
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.word.as_str())
+                .collect::<Vec<_>>(),
+            ["recieve"]
+        );
+    }
+
+    #[test]
+    fn unicode_apostrophes_preserve_byte_boundaries_and_columns() {
+        let issues = scan_text(
+            Path::new("sample.md"),
+            "café’\u{e9}rrror 😀 mispeling",
+            &test_dictionary(),
+        );
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (issue.word.as_str(), issue.col))
+                .collect::<Vec<_>>(),
+            [("érrror", 6), ("mispeling", 16)]
+        );
+    }
+
+    #[test]
+    fn url_ranges_use_the_earliest_scheme_and_keep_adjacent_words() {
+        let text = "https://example.test http://example.test recieve";
+        assert_eq!(url_ranges(text), [(0, 20), (21, 40)]);
+        let issues = scan_text(Path::new("sample.ts"), text, &test_dictionary());
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.word.as_str())
+                .collect::<Vec<_>>(),
+            ["recieve"]
+        );
+    }
+
+    #[test]
+    fn compounds_require_a_valid_start_and_end() {
+        let dictionary = test_dictionary();
+        assert!(is_compound("ratelimitreset", &dictionary));
+        for invalid in ["ratelimit", "limitreset", "resetlimit", "raterecieve"] {
+            assert!(!is_compound(invalid, &dictionary), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn directives_do_not_leak_next_line_state_past_one_line() {
+        let issues = scan_text(
+            Path::new("sample.php"),
+            "// cspell:disable-next-line\r\nrecieve\r\nmispeling\r\n",
+            &test_dictionary(),
+        );
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (issue.word.as_str(), issue.row))
+                .collect::<Vec<_>>(),
+            [("mispeling", 3)]
+        );
+    }
+
+    #[test]
+    fn seeded_token_boundaries_preserve_each_inserted_misspelling() {
+        let dictionary = test_dictionary();
+        let mut state = 0x5eed_u32;
+        let boundaries = [" ", "_", ".", "-", "/", "😀", "\t", ":"];
+        for _ in 0..128 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let boundary = boundaries[state as usize % boundaries.len()];
+            let text = format!("hello{boundary}recieve{boundary}world");
+            let issues = scan_text(Path::new("sample.ts"), &text, &dictionary);
+            assert_eq!(issues.len(), 1, "{text}");
+            assert_eq!(issues[0].word, "recieve", "{text}");
+            assert_eq!(issues[0].col, 6 + boundary.encode_utf16().count(), "{text}");
+        }
+    }
+}

@@ -20,8 +20,7 @@ concurrency:
 jobs:
   probe:
     if: github.event.requested_reviewer.login == 'diagonalprobe'
-    uses: Diagonal-HQ/probe/.github/workflows/code-review.yml@v1
+    uses: Diagonal-HQ/probe/.github/workflows/code-review.yml@main
     with:
-      probe-ref: v1
-      # setup-command: npm ci
+      probe-ref: main
     secrets: inherit

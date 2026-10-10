@@ -27,4 +27,52 @@ The extraction script is `scripts/spellcheck-rust/prepare-dictionary.mjs` at com
 
 The output is the union of all four passes: `@compound<TAB>part` lines first, then the words, each group deduplicated and sorted with `localeCompare(…, 'en-US')`.
 
-To rebuild, check out that script, run it in a directory containing the configuration above and the pinned packages, and replace its metadata header with the four comment lines at the top of the current `lexicon.txt`. The result should match the current word list exactly. Regenerate `NOTICE.md` from the same installed packages, and update the versions in this file.
+## Rebuilding
+
+The script resolves `cspell.json` and `package-lock.json` from the directory two levels above itself, and it loads CSpell from that directory's `node_modules`. This lays out a working directory to match:
+
+```sh
+work=$(mktemp -d)
+mkdir -p "$work/scripts/spellcheck-rust"
+git show 7838b9f:scripts/spellcheck-rust/prepare-dictionary.mjs \
+  > "$work/scripts/spellcheck-rust/prepare-dictionary.mjs"
+cat > "$work/cspell.json" <<'JSON'
+{
+  "version": "0.2",
+  "language": "en",
+  "dictionaries": ["software-terms", "node", "typescript", "html", "css", "php", "fonts"]
+}
+JSON
+# Pins every contributing dictionary to its NOTICE.md version. Without the overrides,
+# npm resolves newer dictionary releases and the word list differs.
+cat > "$work/package.json" <<'JSON'
+{
+  "private": true,
+  "dependencies": { "cspell": "10.1.1" },
+  "overrides": {
+    "@cspell/dict-aws": "4.0.17",
+    "@cspell/dict-companies": "3.2.12",
+    "@cspell/dict-cryptocurrencies": "5.0.5",
+    "@cspell/dict-css": "4.1.2",
+    "@cspell/dict-django": "4.1.6",
+    "@cspell/dict-en_us": "4.4.36",
+    "@cspell/dict-filetypes": "3.0.18",
+    "@cspell/dict-fonts": "4.0.6",
+    "@cspell/dict-fullstack": "3.2.9",
+    "@cspell/dict-html": "4.0.16",
+    "@cspell/dict-html-symbol-entities": "4.0.5",
+    "@cspell/dict-node": "5.0.9",
+    "@cspell/dict-npm": "5.2.47",
+    "@cspell/dict-php": "4.1.1",
+    "@cspell/dict-public-licenses": "2.0.16",
+    "@cspell/dict-software-terms": "5.4.1",
+    "@cspell/dict-typescript": "3.2.3"
+  }
+}
+JSON
+cd "$work"
+npm install --ignore-scripts --no-audit --no-fund   # also writes package-lock.json
+node scripts/spellcheck-rust/prepare-dictionary.mjs lexicon.txt
+```
+
+`lexicon.txt` in `$work` then has the script's metadata header followed by the word list. Replace that header with the four comment lines at the top of the current `lexicon/lexicon.txt`. The word list then matches the current one exactly; this recipe was checked byte-for-byte against the committed lexicon. Regenerate `NOTICE.md` from the same installed packages, and update the versions in this file.

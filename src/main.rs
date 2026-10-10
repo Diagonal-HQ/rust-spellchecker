@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use ignore::WalkBuilder;
@@ -668,22 +668,35 @@ fn walk(directory: &Path, filter: &Arc<Filter>, inputs: &mut Vec<Input>) -> Resu
     Ok(())
 }
 
-fn scan_all(inputs: &[Input], dictionary: &Dictionary) -> Vec<Result<Vec<Issue>, String>> {
+/// Scans `inputs` in parallel and returns each file's issues in input order, or the first
+/// error in input order.
+fn scan_all(inputs: &[Input], dictionary: &Dictionary) -> Result<Vec<Vec<Issue>>, String> {
     let workers = thread::available_parallelism()
         .map_or(1, usize::from)
         .min(inputs.len().max(1));
     let next = AtomicUsize::new(0);
+    // Set on the first error so workers stop claiming files. Files are claimed in order, so
+    // every file before a failing one has been claimed and finishes, and the earliest error
+    // is still the one reported.
+    let failed = AtomicBool::new(false);
     let mut results: Vec<(usize, Result<Vec<Issue>, String>)> = thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
                     let mut scanned = Vec::new();
                     loop {
+                        if failed.load(Ordering::Relaxed) {
+                            break scanned;
+                        }
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(input) = inputs.get(index) else {
                             break scanned;
                         };
-                        scanned.push((index, scan_file(input, dictionary)));
+                        let result = scan_file(input, dictionary);
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        scanned.push((index, result));
                     }
                 })
             })
@@ -833,9 +846,7 @@ fn run() -> Result<i32, String> {
         add_words(&mut dictionary, &read_word_file(&path)?);
     }
 
-    let issues = scan_all(&inputs, &dictionary)
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    let issues = scan_all(&inputs, &dictionary)?;
     let found = issues.iter().any(|file_issues| !file_issues.is_empty());
     match write_issues(issues.iter().flatten()) {
         // A closed pipe (e.g. `| head`) only means the reader has seen enough.
@@ -1002,6 +1013,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["recieve"]
         );
+    }
+
+    #[test]
+    fn scan_all_keeps_input_order_and_reports_the_earliest_error() {
+        let directory = env::temp_dir().join(format!("scan-all-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let mut inputs: Vec<Input> = (0..200)
+            .rev()
+            .map(|index| {
+                let path = directory.join(format!("{index}.md"));
+                fs::write(&path, "hello recieve\n").unwrap();
+                Input {
+                    path,
+                    discovered: false,
+                }
+            })
+            .collect();
+        let dictionary = test_dictionary();
+        let paths: Vec<String> = scan_all(&inputs, &dictionary)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|issue| issue.path)
+            .collect();
+        let expected: Vec<String> = inputs
+            .iter()
+            .map(|input| input.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(paths, expected);
+
+        for (position, name) in [(150, "late.md"), (40, "early.md")] {
+            inputs.insert(
+                position,
+                Input {
+                    path: directory.join(name),
+                    discovered: false,
+                },
+            );
+        }
+        let error = scan_all(&inputs, &dictionary).unwrap_err();
+        fs::remove_dir_all(&directory).unwrap();
+        assert!(error.contains("early.md"), "{error}");
     }
 
     #[test]

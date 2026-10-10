@@ -76,6 +76,8 @@ pub fn absolute(cwd: &Path, path: &Path) -> PathBuf {
 struct Patterns {
     root: PathBuf,
     matcher: Gitignore,
+    /// Only the unanchored globs, for paths outside `root`.
+    outside: Gitignore,
 }
 
 impl Patterns {
@@ -85,15 +87,27 @@ impl Patterns {
         source: &str,
     ) -> Result<Self, String> {
         let mut builder = GitignoreBuilder::new(&root);
+        let mut outside = GitignoreBuilder::new(&root);
         for glob in globs {
             builder
                 .add_line(None, glob)
                 .map_err(|error| format!("invalid {source} glob {glob}: {error}"))?;
+            if !is_anchored(glob) {
+                outside
+                    .add_line(None, glob)
+                    .map_err(|error| format!("invalid {source} glob {glob}: {error}"))?;
+            }
         }
-        let matcher = builder
-            .build()
-            .map_err(|error| format!("invalid {source} globs: {error}"))?;
-        Ok(Self { root, matcher })
+        let build = |builder: GitignoreBuilder| {
+            builder
+                .build()
+                .map_err(|error| format!("invalid {source} globs: {error}"))
+        };
+        Ok(Self {
+            root,
+            matcher: build(builder)?,
+            outside: build(outside)?,
+        })
     }
 
     fn matches(&self, path: &Path, is_dir: bool) -> bool {
@@ -105,9 +119,17 @@ impl Patterns {
             // Outside the root only unanchored globs such as `*.lock` can apply.
             Err(_) => path
                 .file_name()
-                .is_some_and(|name| self.matcher.matched(Path::new(name), is_dir).is_ignore()),
+                .is_some_and(|name| self.outside.matched(Path::new(name), is_dir).is_ignore()),
         }
     }
+}
+
+/// Whether a gitignore glob matches only from its root: it contains a `/` other than a
+/// trailing one or a leading `**/`.
+fn is_anchored(glob: &str) -> bool {
+    let glob = glob.strip_prefix('!').unwrap_or(glob);
+    let glob = glob.strip_suffix('/').unwrap_or(glob);
+    glob.strip_prefix("**/").unwrap_or(glob).contains('/')
 }
 
 /// Decides which paths are checked. All paths are resolved against the working directory.
@@ -215,6 +237,25 @@ mod tests {
         assert!(!filter.selects_file(Path::new("core/src/ThingTest.test.php")));
         assert!(filter.selects_file(Path::new("core/src/keep.test.php")));
         assert!(filter.is_excluded(Path::new("legacy"), true));
+    }
+
+    #[test]
+    fn anchored_config_globs_do_not_match_outside_the_config_directory() {
+        let config = loaded(
+            "config",
+            r#"
+            include = ["/*.md", "docs/*.txt", "*.rs"]
+            exclude = ["/skip.rs", "*.gen.rs"]
+            "#,
+        );
+        let filter = Filter::new(Path::new("/repo"), &[], Some(&config)).unwrap();
+        assert!(filter.selects_file(Path::new("config/notes.md")));
+        assert!(!filter.selects_file(Path::new("other/typo.md")));
+        assert!(!filter.selects_file(Path::new("other/docs/a.txt")));
+        assert!(filter.selects_file(Path::new("other/main.rs")));
+        assert!(filter.selects_file(Path::new("other/skip.rs")));
+        assert!(!filter.selects_file(Path::new("config/skip.rs")));
+        assert!(!filter.selects_file(Path::new("other/x.gen.rs")));
     }
 
     #[test]

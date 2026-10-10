@@ -415,3 +415,25 @@ fn a_closed_output_pipe_ends_the_run_quietly() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unwritable_output_is_an_error() {
+    let fixture = Fixture::new();
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_diagonal-spellcheck"))
+        .current_dir(&fixture.0)
+        .args(["--no-config", "typo.md"])
+        .stdout(full)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .starts_with("could not write output:")
+    );
+}

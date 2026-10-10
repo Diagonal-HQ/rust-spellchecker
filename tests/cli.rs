@@ -148,13 +148,17 @@ fn missing_empty_and_invalid_utf8_dictionaries_never_return_clean() {
 fn nested_absolute_file_lists_preserve_order_and_crlf() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.0.join("nested")).unwrap();
+    fs::write(fixture.0.join("b.md"), "mispeling\n").unwrap();
     let typo = fixture.0.join("typo.md");
+    let second = fixture.0.join("b.md");
+    // Listed against name order, so sorting the inputs would change the output.
     fs::write(
         fixture.0.join("nested/files.txt"),
         format!(
-            "{}\r\n\r\n{}\r\n",
+            "{}\r\n\r\n{}\r\n{}\r\n",
             fixture.0.join("clean.md").display(),
-            typo.display()
+            typo.display(),
+            second.display()
         ),
     )
     .unwrap();
@@ -165,9 +169,15 @@ fn nested_absolute_file_lists_preserve_order_and_crlf() {
         "nested/files.txt",
     ]);
     assert_eq!(result.status.code(), Some(1));
-    let output = String::from_utf8(result.stdout).unwrap();
-    assert!(output.contains(&format!("\"path\":\"{}\"", typo.display())));
-    assert!(output.contains("\"word\":\"recieve\""));
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        format!(
+            "{{\"path\":\"{}\",\"row\":1,\"col\":4,\"word\":\"recieve\"}}\n\
+             {{\"path\":\"{}\",\"row\":1,\"col\":1,\"word\":\"mispeling\"}}\n",
+            typo.display(),
+            second.display()
+        )
+    );
 }
 
 #[test]

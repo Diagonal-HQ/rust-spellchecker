@@ -244,6 +244,7 @@ fn directories_are_walked_in_order_and_respect_ignore_rules() {
     fs::write(project.join("skipped/x.md"), "excludedtypo\n").unwrap();
     fs::write(project.join("package-lock.json"), "{\"lockfiletypo\": 1}\n").unwrap();
     fs::write(project.join("image.png"), [0x89, b'P', b'N', b'G', 0, b'x']).unwrap();
+    fs::write(project.join("nul.txt"), "recieve\0\n").unwrap();
     fs::write(project.join("latin1.txt"), [b'c', b'a', b'f', 0xe9]).unwrap();
 
     let result = fixture.run(&["--exclude", "project/skipped/**", "project"]);

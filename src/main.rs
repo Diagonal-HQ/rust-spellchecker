@@ -1,24 +1,20 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 
-const MAIN_SOURCE: &str = include_str!("main.rs");
-const CARGO_TOML: &str = include_str!("../Cargo.toml");
-const CARGO_LOCK: &str = include_str!("../Cargo.lock");
+use ignore::WalkBuilder;
 
-fn fnv1a64(value: &[u8]) -> u64 {
-    value.iter().fold(0xcbf29ce484222325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    })
-}
+mod config;
+use config::Filter;
 
-fn print_provenance() {
-    println!("main.rs.fnv1a64={:016x}", fnv1a64(MAIN_SOURCE.as_bytes()));
-    println!("Cargo.toml.fnv1a64={:016x}", fnv1a64(CARGO_TOML.as_bytes()));
-    println!("Cargo.lock.fnv1a64={:016x}", fnv1a64(CARGO_LOCK.as_bytes()));
-}
+const BUILTIN_LEXICON: &str = include_str!("../lexicon/lexicon.txt");
+
+const DIRECTIVE_PREFIX: &str = "spellcheck:";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Issue {
@@ -51,21 +47,29 @@ fn json_escape(value: &str) -> String {
     escaped
 }
 
-fn load_dictionary(path: &Path) -> Result<Dictionary, String> {
-    let content = fs::read_to_string(path)
-        .map_err(|error| format!("could not read dictionary {}: {error}", path.display()))?;
+fn read_word_file(path: &Path) -> Result<String, String> {
+    fs::read_to_string(path)
+        .map_err(|error| format!("could not read dictionary {}: {error}", path.display()))
+}
+
+fn parse_dictionary(content: &str) -> Dictionary {
     let mut dictionary = Dictionary {
         words: HashSet::new(),
         compound_start: HashSet::new(),
         compound_middle: HashSet::new(),
         compound_end: HashSet::new(),
     };
+    add_words(&mut dictionary, content);
+    dictionary
+}
+
+fn add_words(dictionary: &mut Dictionary, content: &str) {
     for line in content
         .lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
     {
         let Some(marker) = line.strip_prefix("@compound\t") else {
-            dictionary.words.insert(line.to_owned());
+            dictionary.words.insert(line.to_locale_lowercase());
             continue;
         };
         let leading = marker.starts_with('+');
@@ -84,18 +88,18 @@ fn load_dictionary(path: &Path) -> Result<Dictionary, String> {
             _ => {}
         }
     }
-    if dictionary.words.is_empty() {
-        return Err("dictionary contains no accepted words".into());
-    }
-    Ok(dictionary)
+}
+
+fn has_directive(lowercase: &str, command: &str) -> bool {
+    lowercase.contains(&format!("{DIRECTIVE_PREFIX}{command}"))
 }
 
 fn parse_directive_words(line: &str) -> Vec<String> {
     let lowercase = line.to_ascii_lowercase();
-    let Some(cspell) = lowercase.find("cspell:") else {
+    let Some(start) = lowercase.find(DIRECTIVE_PREFIX) else {
         return Vec::new();
     };
-    let directive = &line[cspell + "cspell:".len()..];
+    let directive = &line[start + DIRECTIVE_PREFIX.len()..];
     let mut fields = directive.split(|c: char| c.is_whitespace() || c == ',' || c == ';');
     let Some(command) = fields.next() else {
         return Vec::new();
@@ -373,10 +377,12 @@ fn email_ranges(line: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     for (at, _) in line.match_indices('@') {
         let start = line[..at]
-            .rfind(|character: char| {
+            .char_indices()
+            .rev()
+            .find(|&(_, character)| {
                 character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '<' | '>')
             })
-            .map_or(0, |index| index + 1);
+            .map_or(0, |(index, character)| index + character.len_utf8());
         let end = line[at..]
             .find(|character: char| {
                 character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '<' | '>')
@@ -501,10 +507,26 @@ fn byte_to_column(line: &str, byte: usize) -> usize {
     line[..byte].encode_utf16().count() + 1
 }
 
-fn scan_file(path: &Path, dictionary: &Dictionary) -> Result<Vec<Issue>, String> {
-    let content = fs::read_to_string(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    Ok(scan_text(path, &content, dictionary))
+struct Input {
+    path: PathBuf,
+    // Files found by walking a directory are skipped when they are binary or not UTF-8.
+    discovered: bool,
+}
+
+fn scan_file(input: &Input, dictionary: &Dictionary) -> Result<Vec<Issue>, String> {
+    let bytes = fs::read(&input.path)
+        .map_err(|error| format!("could not read {}: {error}", input.path.display()))?;
+    if input.discovered && bytes.contains(&0) {
+        return Ok(Vec::new());
+    }
+    match String::from_utf8(bytes) {
+        Ok(content) => Ok(scan_text(&input.path, &content, dictionary)),
+        Err(_) if input.discovered => Ok(Vec::new()),
+        Err(_) => Err(format!(
+            "could not read {}: not valid UTF-8",
+            input.path.display()
+        )),
+    }
 }
 
 fn scan_text(path: &Path, content: &str, dictionary: &Dictionary) -> Vec<Issue> {
@@ -519,25 +541,25 @@ fn scan_text(path: &Path, content: &str, dictionary: &Dictionary) -> Vec<Issue> 
     let mut disable_next_line = false;
     for (index, line) in lines.iter().enumerate() {
         let lowercase = line.to_lowercase();
-        let is_directive_line = lowercase.contains("cspell:");
+        let is_directive_line = has_directive(&lowercase, "");
         let disabled_for_line = disabled_block || disable_next_line;
         disable_next_line = false;
 
-        if lowercase.contains("cspell:disable-next-line")
-            || lowercase.contains("cspell:disable-next")
-        {
-            disable_next_line = true;
+        if is_directive_line {
+            if has_directive(&lowercase, "disable-next") {
+                disable_next_line = true;
+            }
+            if has_directive(&lowercase, "disable")
+                && !has_directive(&lowercase, "disable-line")
+                && !has_directive(&lowercase, "disable-next")
+            {
+                disabled_block = true;
+            }
+            if has_directive(&lowercase, "enable") {
+                disabled_block = false;
+            }
         }
-        if lowercase.contains("cspell:disable")
-            && !lowercase.contains("cspell:disable-line")
-            && !lowercase.contains("cspell:disable-next")
-        {
-            disabled_block = true;
-        }
-        if lowercase.contains("cspell:enable") {
-            disabled_block = false;
-        }
-        if disabled_for_line || is_directive_line || lowercase.contains("cspell:disable-line") {
+        if disabled_for_line || is_directive_line {
             continue;
         }
 
@@ -611,16 +633,103 @@ fn scan_text(path: &Path, content: &str, dictionary: &Dictionary) -> Vec<Issue> 
 }
 
 fn usage() -> &'static str {
-    "usage: diagonal-spellcheck --dictionary PATH [--file-list PATH|-] [FILES...]"
+    "usage: diagonal-spellcheck [--config PATH|--no-config] [--dictionary PATH] [--words PATH]... [--exclude GLOB]... [--file-list PATH|-] [PATHS...]"
+}
+
+fn walk(directory: &Path, filter: &Arc<Filter>, inputs: &mut Vec<Input>) -> Result<(), String> {
+    let entry_filter = Arc::clone(filter);
+    let walker = WalkBuilder::new(directory)
+        .require_git(false)
+        .filter_entry(move |entry| {
+            let is_dir = entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir());
+            entry.depth() == 0 || !entry_filter.is_excluded(entry.path(), is_dir)
+        })
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .build();
+    for entry in walker {
+        let entry =
+            entry.map_err(|error| format!("could not walk {}: {error}", directory.display()))?;
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+            && filter.selects_file(entry.path())
+        {
+            let path = entry.into_path();
+            inputs.push(Input {
+                path: path
+                    .strip_prefix("./")
+                    .map_or_else(|_| path.clone(), Path::to_path_buf),
+                discovered: true,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Scans `inputs` in parallel and returns each file's issues in input order, or the first
+/// error in input order.
+fn scan_all(inputs: &[Input], dictionary: &Dictionary) -> Result<Vec<Vec<Issue>>, String> {
+    let workers = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(inputs.len().max(1));
+    let next = AtomicUsize::new(0);
+    // Set on the first error so workers stop claiming files. Files are claimed in order, so
+    // every file before a failing one has been claimed and finishes, and the earliest error
+    // is still the one reported.
+    let failed = AtomicBool::new(false);
+    let mut results: Vec<(usize, Result<Vec<Issue>, String>)> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut scanned = Vec::new();
+                    loop {
+                        if failed.load(Ordering::Relaxed) {
+                            break scanned;
+                        }
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(input) = inputs.get(index) else {
+                            break scanned;
+                        };
+                        let result = scan_file(input, dictionary);
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        scanned.push((index, result));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("scan worker panicked"))
+            .collect()
+    });
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 fn run() -> Result<i32, String> {
     let mut arguments = env::args().skip(1);
     let mut dictionary = None;
+    let mut extra_words = Vec::new();
+    let mut excludes = Vec::new();
     let mut file_list = None;
-    let mut files = Vec::new();
+    let mut config_path = None;
+    let mut no_config = false;
+    let mut paths = Vec::new();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--config" if config_path.is_none() && !no_config => {
+                config_path = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| format!("--config requires a path\n{}", usage()))?,
+                ));
+            }
+            "--no-config" if config_path.is_none() && !no_config => no_config = true,
             "--dictionary" if dictionary.is_none() => {
                 dictionary = Some(PathBuf::from(
                     arguments
@@ -628,6 +737,22 @@ fn run() -> Result<i32, String> {
                         .filter(|value| !value.starts_with('-'))
                         .ok_or_else(|| format!("--dictionary requires a path\n{}", usage()))?,
                 ));
+            }
+            "--words" => {
+                extra_words.push(PathBuf::from(
+                    arguments
+                        .next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| format!("--words requires a path\n{}", usage()))?,
+                ));
+            }
+            "--exclude" => {
+                excludes.push(
+                    arguments
+                        .next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| format!("--exclude requires a glob\n{}", usage()))?,
+                );
             }
             "--file-list" if file_list.is_none() => {
                 file_list = Some(
@@ -641,10 +766,6 @@ fn run() -> Result<i32, String> {
                 println!("diagonal-spellcheck {}", env!("CARGO_PKG_VERSION"));
                 return Ok(0);
             }
-            "--provenance" => {
-                print_provenance();
-                return Ok(0);
-            }
             "--help" | "-h" => {
                 println!("{}", usage());
                 return Ok(0);
@@ -652,11 +773,19 @@ fn run() -> Result<i32, String> {
             value if value.starts_with('-') => {
                 return Err(format!("unknown option {value}\n{}", usage()));
             }
-            value => files.push(PathBuf::from(value)),
+            value => paths.push(PathBuf::from(value)),
         }
     }
-    let dictionary_path =
-        dictionary.ok_or_else(|| format!("--dictionary is required\n{}", usage()))?;
+    let cwd = env::current_dir()
+        .map_err(|error| format!("could not read the working directory: {error}"))?;
+    let config_path = if no_config {
+        None
+    } else {
+        config_path.or_else(|| config::discover(&cwd))
+    };
+    let loaded = config_path.as_deref().map(config::load).transpose()?;
+
+    let reads_list = file_list.is_some();
     if let Some(list) = file_list {
         let reader: Box<dyn BufRead> = if list == "-" {
             Box::new(io::BufReader::new(io::stdin()))
@@ -668,29 +797,80 @@ fn run() -> Result<i32, String> {
         for line in reader.lines() {
             let line = line.map_err(|error| format!("could not read file list: {error}"))?;
             if !line.is_empty() {
-                files.push(PathBuf::from(line));
+                paths.push(PathBuf::from(line));
             }
         }
     }
-    if files.is_empty() {
-        return Err(format!("no input files\n{}", usage()));
+    if paths.is_empty() {
+        if reads_list {
+            return Err(format!("no input paths\n{}", usage()));
+        }
+        // Without explicit paths, check the project the config describes, or the working directory.
+        paths.push(
+            loaded
+                .as_ref()
+                .map_or_else(|| PathBuf::from("."), |loaded| loaded.directory.clone()),
+        );
     }
 
-    let dictionary = load_dictionary(&dictionary_path)?;
-    let mut found = 0;
-    for path in files {
-        for issue in scan_file(&path, &dictionary)? {
-            println!(
-                "{{\"path\":\"{}\",\"row\":{},\"col\":{},\"word\":\"{}\",\"suggestions\":[]}}",
-                json_escape(&issue.path),
-                issue.row,
-                issue.col,
-                json_escape(&issue.word),
-            );
-            found += 1;
+    let filter = Arc::new(Filter::new(&cwd, &excludes, loaded.as_ref())?);
+    let mut inputs = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            walk(&path, &filter, &mut inputs)?;
+        } else if filter.selects_file(&path) {
+            inputs.push(Input {
+                path,
+                discovered: false,
+            });
         }
     }
-    Ok(if found == 0 { 0 } else { 1 })
+
+    let mut dictionary = match dictionary {
+        Some(path) => parse_dictionary(&read_word_file(&path)?),
+        None => parse_dictionary(BUILTIN_LEXICON),
+    };
+    if dictionary.words.is_empty() {
+        return Err("dictionary contains no accepted words".into());
+    }
+    if let Some(loaded) = &loaded {
+        add_words(&mut dictionary, &loaded.config.words.join("\n"));
+        for path in &loaded.config.word_files {
+            add_words(
+                &mut dictionary,
+                &read_word_file(&loaded.directory.join(path))?,
+            );
+        }
+    }
+    for path in extra_words {
+        add_words(&mut dictionary, &read_word_file(&path)?);
+    }
+
+    let issues = scan_all(&inputs, &dictionary)?;
+    let found = issues.iter().any(|file_issues| !file_issues.is_empty());
+    match write_issues(issues.iter().flatten()) {
+        // A closed pipe (e.g. `| head`) only means the reader has seen enough.
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
+            return Err(format!("could not write output: {error}"));
+        }
+        _ => {}
+    }
+    Ok(if found { 1 } else { 0 })
+}
+
+fn write_issues<'a>(issues: impl Iterator<Item = &'a Issue>) -> io::Result<()> {
+    let mut out = BufWriter::new(io::stdout().lock());
+    for issue in issues {
+        writeln!(
+            out,
+            "{{\"path\":\"{}\",\"row\":{},\"col\":{},\"word\":\"{}\"}}",
+            json_escape(&issue.path),
+            issue.row,
+            issue.col,
+            json_escape(&issue.word),
+        )?;
+    }
+    out.flush()
 }
 
 fn main() {
@@ -732,17 +912,17 @@ mod tests {
     #[test]
     fn extracts_directive_words() {
         assert_eq!(
-            parse_directive_words("// cspell:words Zorbulate, LocalThing"),
+            parse_directive_words("// spellcheck:words Zorbulate, LocalThing"),
             ["zorbulate", "localthing"]
         );
         assert_eq!(
-            parse_directive_words("İ // cspell:words Zorbulate"),
+            parse_directive_words("İ // spellcheck:words Zorbulate"),
             ["zorbulate"]
         );
     }
 
     #[test]
-    fn identifies_cspell_style_hex_sequences() {
+    fn identifies_hex_sequences() {
         assert!(is_hex_sequence("f8fafc"));
         assert!(is_hex_sequence("e764e712-30e8-724d-a86f-eadf8dfcd067"));
         assert!(!is_hex_sequence("recieve"));
@@ -755,12 +935,6 @@ mod tests {
         let ranges = base64_ranges(line);
         assert_eq!(ranges.len(), 1);
         assert!(line[ranges[0].0..ranges[0].1].starts_with("iVBOR"));
-    }
-
-    #[test]
-    fn provenance_hash_changes_with_content() {
-        assert_ne!(fnv1a64(b"one"), fnv1a64(b"two"));
-        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
     }
 
     fn test_dictionary() -> Dictionary {
@@ -828,6 +1002,62 @@ mod tests {
     }
 
     #[test]
+    fn email_ranges_start_after_multi_byte_whitespace() {
+        let text = "\u{2003}a@b.c recieve";
+        assert_eq!(email_ranges(text), [(3, 8)]);
+        let issues = scan_text(Path::new("sample.md"), text, &test_dictionary());
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.word.as_str())
+                .collect::<Vec<_>>(),
+            ["recieve"]
+        );
+    }
+
+    #[test]
+    fn scan_all_keeps_input_order_and_reports_the_earliest_error() {
+        let directory = env::temp_dir().join(format!("scan-all-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let mut inputs: Vec<Input> = (0..200)
+            .rev()
+            .map(|index| {
+                let path = directory.join(format!("{index}.md"));
+                fs::write(&path, "hello recieve\n").unwrap();
+                Input {
+                    path,
+                    discovered: false,
+                }
+            })
+            .collect();
+        let dictionary = test_dictionary();
+        let paths: Vec<String> = scan_all(&inputs, &dictionary)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|issue| issue.path)
+            .collect();
+        let expected: Vec<String> = inputs
+            .iter()
+            .map(|input| input.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(paths, expected);
+
+        for (position, name) in [(150, "late.md"), (40, "early.md")] {
+            inputs.insert(
+                position,
+                Input {
+                    path: directory.join(name),
+                    discovered: false,
+                },
+            );
+        }
+        let error = scan_all(&inputs, &dictionary).unwrap_err();
+        fs::remove_dir_all(&directory).unwrap();
+        assert!(error.contains("early.md"), "{error}");
+    }
+
+    #[test]
     fn compounds_require_a_valid_start_and_end() {
         let dictionary = test_dictionary();
         assert!(is_compound("ratelimitreset", &dictionary));
@@ -840,7 +1070,7 @@ mod tests {
     fn directives_do_not_leak_next_line_state_past_one_line() {
         let issues = scan_text(
             Path::new("sample.php"),
-            "// cspell:disable-next-line\r\nrecieve\r\nmispeling\r\n",
+            "// spellcheck:disable-next-line\r\nrecieve\r\nmispeling\r\n",
             &test_dictionary(),
         );
         assert_eq!(
@@ -850,6 +1080,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("mispeling", 3)]
         );
+    }
+
+    #[test]
+    fn block_directives_disable_until_enabled() {
+        let issues = scan_text(
+            Path::new("sample.md"),
+            "<!-- spellcheck:disable -->\nrecieve\n<!-- spellcheck:enable -->\nmispeling\n",
+            &test_dictionary(),
+        );
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (issue.word.as_str(), issue.row))
+                .collect::<Vec<_>>(),
+            [("mispeling", 4)]
+        );
+    }
+
+    #[test]
+    fn builtin_lexicon_accepts_english_and_coding_compounds() {
+        let dictionary = parse_dictionary(BUILTIN_LEXICON);
+        for word in ["receive", "definitely", "javascript", "typescript"] {
+            assert!(is_accepted(word, &dictionary, &HashSet::new()), "{word}");
+        }
+        for word in ["recieve", "definately", "misspeling"] {
+            assert!(!is_accepted(word, &dictionary, &HashSet::new()), "{word}");
+        }
+        assert!(!dictionary.compound_start.is_empty());
     }
 
     #[test]

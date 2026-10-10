@@ -1,0 +1,18 @@
+[package]
+name = "diagonal-spellcheck"
+version = "0.1.0"
+edition = "2024"
+description = "A source-code spellchecker with an embedded English and software-terms lexicon"
+repository = "https://github.com/Diagonal-HQ/rust-spellchecker"
+readme = "README.md"
+publish = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dependencies]
+ignore = "0.4"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"

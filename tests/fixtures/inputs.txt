@@ -1,0 +1,7 @@
+tests/fixtures/parity.php
+tests/fixtures/parity.ts
+tests/fixtures/sample.blade.php
+tests/fixtures/sample.md
+tests/fixtures/sample.php
+tests/fixtures/sample.ts
+tests/fixtures/sample.tsx

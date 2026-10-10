@@ -8,7 +8,7 @@ This sentnce contains an intentional misspeling.
 const documantationCode = 'recieve';
 ```
 
-<!-- cspell:disable-next-line -->
-This definately stays disabled for CSpell.
+<!-- spellcheck:disable-next-line -->
+This definately stays disabled for the checker.
 
 Unicode words: café, naïve, and résumé.

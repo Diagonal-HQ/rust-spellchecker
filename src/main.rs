@@ -377,10 +377,12 @@ fn email_ranges(line: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     for (at, _) in line.match_indices('@') {
         let start = line[..at]
-            .rfind(|character: char| {
+            .char_indices()
+            .rev()
+            .find(|&(_, character)| {
                 character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '<' | '>')
             })
-            .map_or(0, |index| index + 1);
+            .map_or(0, |(index, character)| index + character.len_utf8());
         let end = line[at..]
             .find(|character: char| {
                 character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '<' | '>')
@@ -969,6 +971,20 @@ mod tests {
         let text = "https://example.test http://example.test recieve";
         assert_eq!(url_ranges(text), [(0, 20), (21, 40)]);
         let issues = scan_text(Path::new("sample.ts"), text, &test_dictionary());
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.word.as_str())
+                .collect::<Vec<_>>(),
+            ["recieve"]
+        );
+    }
+
+    #[test]
+    fn email_ranges_start_after_multi_byte_whitespace() {
+        let text = "\u{2003}a@b.c recieve";
+        assert_eq!(email_ranges(text), [(3, 8)]);
+        let issues = scan_text(Path::new("sample.md"), text, &test_dictionary());
         assert_eq!(
             issues
                 .iter()

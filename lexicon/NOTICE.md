@@ -126,7 +126,7 @@ THE SOFTWARE.
 
 ## @cspell/dict-django 4.1.6
 
-License: MIT. Dictionaries: `django`.
+License: the package's `package.json` declares MIT, but the license file it ships is the WTFPL, reproduced below. Both are permissive. Dictionaries: `django`.
 
 ### LICENSE
 

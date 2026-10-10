@@ -85,10 +85,9 @@ jobs:
           binary="target/${{ matrix.target }}/release/$BINARY"
           "$binary" --version
           set +e
+          # Same command as tests/fixtures.rs.
           "$binary" --no-config --words tests/fixtures/words.txt \
-            tests/fixtures/parity.php tests/fixtures/parity.ts tests/fixtures/sample.blade.php \
-            tests/fixtures/sample.md tests/fixtures/sample.php tests/fixtures/sample.ts \
-            tests/fixtures/sample.tsx > findings.jsonl
+            --file-list tests/fixtures/inputs.txt > findings.jsonl
           status=$?
           set -e
           test "$status" -eq 1

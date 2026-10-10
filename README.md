@@ -96,9 +96,9 @@ Lines containing a directive are never checked.
 
 ## Lexicon
 
-[`lexicon/lexicon.txt`](lexicon/lexicon.txt) is the built-in word list, embedded at compile time. It has about 245,800 lower-cased words, copied from the CSpell 10.1.1 dictionaries (English, software terms, TypeScript, Node, npm, PHP, HTML, CSS, fonts, AWS, and others). `@compound<TAB>part` lines list compound-word parts: a trailing `+` marks a part that starts a compound, a leading `+` marks one that ends it, and both mark a middle part. [`lexicon/NOTICE.md`](lexicon/NOTICE.md) carries the source packages' licenses (all MIT, plus the SCOWL notice for `en_US`).
+[`lexicon/lexicon.txt`](lexicon/lexicon.txt) is the built-in word list, embedded at compile time. It has about 245,800 lower-cased words, copied from the CSpell 10.1.1 dictionaries (English, software terms, TypeScript, Node, npm, PHP, HTML, CSS, fonts, AWS, and others). `@compound<TAB>part` lines list compound-word parts: a trailing `+` marks a part that starts a compound, a leading `+` marks one that ends it, and both mark a middle part. [`lexicon/NOTICE.md`](lexicon/NOTICE.md) carries the source packages' licenses (MIT, except `@cspell/dict-django`, which declares MIT but ships a WTFPL license file; the notices also include the SCOWL notice for `en_US`).
 
-CSpell supplies only this word data. The tokenizer, filters, directives, and output are this crate's own.
+[`lexicon/SOURCE.md`](lexicon/SOURCE.md) records how the list was extracted and how to rebuild it. CSpell supplies only this word data. The tokenizer, filters, directives, and output are this crate's own.
 
 ## Test
 
@@ -106,7 +106,7 @@ CSpell supplies only this word data. The tokenizer, filters, directives, and out
 cargo test
 ```
 
-`tests/fixtures.rs` checks the fixtures in `tests/fixtures/` against `tests/fixtures/expected.jsonl` using the built-in lexicon.
+`tests/fixtures.rs` checks the fixtures listed in `tests/fixtures/inputs.txt` against `tests/fixtures/expected.jsonl` using the built-in lexicon. The release workflow runs the same check against each built binary.
 
 ## Releasing
 
@@ -116,7 +116,7 @@ cargo test
 - release builds for all three targets, each smoke-tested against the fixtures
 - archives with SHA-256 checksums, uploaded as workflow artifacts
 
-On `main`, if no release exists for the version in `Cargo.toml`, the workflow tags the commit `v<version>` and publishes a GitHub Release with the archives, per-archive `.sha256` files, and a combined `SHA256SUMS`. To release, bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` updates), then merge to `main`. Pushes that don't change the version build and test but publish nothing, so a released version's files never change.
+On `main`, if no release exists for the version in `Cargo.toml`, the workflow tags the commit `v<version>` and publishes a GitHub Release with the archives, per-archive `.sha256` files, and a combined `SHA256SUMS`. To release, bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` updates, update the version in the [install](#install) examples, then merge to `main`. Pushes that don't change the version build and test but publish nothing, so a released version's files never change.
 
 ## Limitations
 

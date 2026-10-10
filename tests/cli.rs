@@ -389,3 +389,29 @@ fn explicit_config_and_invalid_configs() {
     fs::write(fixture.0.join("spellcheck.toml"), "words = [\n").unwrap();
     assert_eq!(fixture.run(&["typo.md"]).status.code(), Some(2));
 }
+
+#[test]
+fn a_closed_output_pipe_ends_the_run_quietly() {
+    let fixture = Fixture::new();
+    // Far more output than a pipe buffer holds, so writing hits the closed pipe.
+    fs::write(
+        fixture.0.join("many.md"),
+        "recieve mispeling\n".repeat(20_000),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_diagonal-spellcheck"))
+        .current_dir(&fixture.0)
+        .args(["--no-config", "many.md"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let result = child.wait_with_output().unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert!(
+        result.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

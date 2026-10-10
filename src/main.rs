@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -836,20 +836,30 @@ fn run() -> Result<i32, String> {
     let issues = scan_all(&inputs, &dictionary)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    let mut found = 0;
-    for file_issues in issues {
-        for issue in file_issues {
-            println!(
-                "{{\"path\":\"{}\",\"row\":{},\"col\":{},\"word\":\"{}\"}}",
-                json_escape(&issue.path),
-                issue.row,
-                issue.col,
-                json_escape(&issue.word),
-            );
-            found += 1;
+    let found = issues.iter().any(|file_issues| !file_issues.is_empty());
+    match write_issues(issues.iter().flatten()) {
+        // A closed pipe (e.g. `| head`) only means the reader has seen enough.
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
+            return Err(format!("could not write output: {error}"));
         }
+        _ => {}
     }
-    Ok(if found == 0 { 0 } else { 1 })
+    Ok(if found { 1 } else { 0 })
+}
+
+fn write_issues<'a>(issues: impl Iterator<Item = &'a Issue>) -> io::Result<()> {
+    let mut out = BufWriter::new(io::stdout().lock());
+    for issue in issues {
+        writeln!(
+            out,
+            "{{\"path\":\"{}\",\"row\":{},\"col\":{},\"word\":\"{}\"}}",
+            json_escape(&issue.path),
+            issue.row,
+            issue.col,
+            json_escape(&issue.word),
+        )?;
+    }
+    out.flush()
 }
 
 fn main() {

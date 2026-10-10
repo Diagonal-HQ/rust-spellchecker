@@ -1,0 +1,27 @@
+
+name: Probe Review
+
+on:
+  pull_request_target:
+    types: [review_requested]
+
+permissions:
+  contents: read
+  issues: read
+  packages: read
+  pull-requests: read
+
+concurrency:
+  # Requests for other reviewers get their own group. A shared group would let
+  # them replace a pending Probe request, which then never gets a review.
+  group: code-review-${{ github.event.pull_request.number }}-${{ github.event.requested_reviewer.login == 'diagonalprobe' && 'probe' || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.event.requested_reviewer.login == 'diagonalprobe'
+    uses: Diagonal-HQ/probe/.github/workflows/code-review.yml@v1
+    with:
+      probe-ref: v1
+      # setup-command: npm ci
+    secrets: inherit

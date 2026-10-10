@@ -95,7 +95,7 @@ jobs:
       - name: Package
         run: |
           mkdir "$ARCHIVE"
-          cp "target/${{ matrix.target }}/release/$BINARY" README.md "$ARCHIVE/"
+          cp "target/${{ matrix.target }}/release/$BINARY" README.md LICENSE-APACHE LICENSE-MIT "$ARCHIVE/"
           # The binary embeds the lexicon, so its license notices ship with every copy.
           cp lexicon/NOTICE.md "$ARCHIVE/NOTICE.md"
           tar -czf "$ARCHIVE.tar.gz" "$ARCHIVE"

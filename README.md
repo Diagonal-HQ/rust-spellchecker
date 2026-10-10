@@ -4,10 +4,10 @@ A source-code spellchecker written in Rust. Its English and software-terms lexic
 
 ## Install
 
-Prebuilt binaries are attached to each [GitHub Release](https://github.com/Diagonal-HQ/rust-spellchecker/releases). They're available for macOS (Apple silicon) and Linux (x86_64 and arm64, statically linked). Each archive contains the binary, this README, and `NOTICE.md`.
+Prebuilt binaries are attached to each [GitHub Release](https://github.com/Diagonal-HQ/rust-spellchecker/releases). They're available for macOS (Apple silicon) and Linux (x86_64 and arm64, statically linked). Each archive contains the binary, this README, the license files, and `NOTICE.md`.
 
 ```sh
-version=0.1.0
+version=0.1.1
 target=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 archive=diagonal-spellcheck-$version-$target.tar.gz
 base=https://github.com/Diagonal-HQ/rust-spellchecker/releases/download/v$version
@@ -20,7 +20,7 @@ sudo install "diagonal-spellcheck-$version-$target/diagonal-spellcheck" /usr/loc
 Or build from source:
 
 ```sh
-cargo install --locked --git https://github.com/Diagonal-HQ/rust-spellchecker --tag v0.1.0
+cargo install --locked --git https://github.com/Diagonal-HQ/rust-spellchecker --tag v0.1.1
 # or, from a checkout:
 cargo build --release   # target/release/diagonal-spellcheck
 ```
@@ -122,3 +122,18 @@ On `main`, if no release exists for the version in `Cargo.toml`, the workflow ta
 
 - No suggestions.
 - No per-language parsing. Every file is tokenized the same way, except that Markdown link targets are skipped in `.md` files.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+The embedded lexicon is third-party data under its own licenses; see [`lexicon/NOTICE.md`](lexicon/NOTICE.md).
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
